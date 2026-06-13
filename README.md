@@ -1,64 +1,86 @@
 # uRWA-Stylus
 
-The first implementation of [ERC-7943](https://eips.ethereum.org/EIPS/eip-7943) (the "uRWA" Universal Real World Asset interface, Final as of 2026-05-27) in Rust for [Arbitrum Stylus](https://docs.arbitrum.io/stylus/gentle-introduction).
+Implementations of [ERC-7943](https://eips.ethereum.org/EIPS/eip-7943) (the "uRWA" Universal Real World Asset interface, Final as of 2026-05-27) in Rust for [Arbitrum Stylus](https://docs.arbitrum.io/stylus/gentle-introduction), built on the audited [`openzeppelin-stylus`](https://github.com/OpenZeppelin/rust-contracts-stylus) primitives.
 
-Built on the audited [`openzeppelin-stylus`](https://github.com/OpenZeppelin/rust-contracts-stylus) primitives (`Erc20` + `AccessControl`). RWA compliance checks (allowlists, freeze accounting) run on every transfer, mint, burn, and forced transfer, which is exactly the workload where Stylus WASM execution beats EVM bytecode on gas.
+RWA compliance checks (allowlists, freeze accounting) run on every transfer, mint, burn, and forced transfer, which is exactly the workload where Stylus WASM execution beats EVM bytecode on gas.
 
-## Status
+## Contracts
 
-- `uRWA20` (fungible) implemented. ERC-721 and ERC-1155 variants are planned next.
-- Hardened against two findings from an independent review of the Solidity reference implementation (see `../REPORT.md`):
-  - `forced_transfer` is a no-op when `from == to` (does not corrupt freeze accounting).
-  - `can_transfer` checks the unfrozen balance unconditionally (no view/execution divergence).
-- ERC-20 metadata (name/symbol/decimals) is a planned follow-up; the core compliance logic is implemented first.
+| Crate | Standard | ERC-7943 surface | Compressed size |
+|-------|----------|------------------|-----------------|
+| [`urwa20`](crates/urwa20) | ERC-20 (+ metadata) | fungible | 17.3 KB |
+| [`urwa1155`](crates/urwa1155) | ERC-1155 | multi-token | 20.8 KB |
+
+Both are under the 24 KB compressed Stylus limit and were validated against the live Arbitrum Sepolia network (`cargo stylus check`).
+
+Each implements send/receive allowlists, role-gated mint/burn (`AccessControl`), per-position freezing, `forcedTransfer` for compliance/recovery, and the `canSend` / `canReceive` / `getFrozenTokens` / `canTransfer` views.
+
+### Divergences from the Solidity reference (deliberate fixes)
+
+These close findings from an independent review of the ERC-7943 Solidity reference implementation:
+
+- **uRWA1155 `safe_batch_transfer_from`** validates each token id against the *accumulated* amount requested for that id across the whole batch. In the reference, repeating an id in one batch bypasses the per-id frozen check and drains frozen tokens; that bug is absent here (test: `duplicate_id_batch_cannot_bypass_freeze`).
+- **`forced_transfer`** is a no-op when `from == to`, so a self-directed seizure cannot zero the freeze accounting while the holder keeps the tokens.
+- **`can_transfer`** reflects true feasibility (unfrozen balance), so it never disagrees with what an actual transfer does.
 
 ## License
 
-This project is licensed under the **Business Source License 1.1** (`BUSL-1.1`); see `LICENSE`.
+Business Source License 1.1 (`BUSL-1.1`); see [`LICENSE`](LICENSE).
 
 - **Change Date:** 2029-06-13. **Change License:** Apache-2.0.
 - Non-commercial, evaluation, research, and testnet use are free. Production/commercial use requires a commercial license from the licensor until the Change Date.
-- **Funding intent:** upon receiving grant funding for this work, the licensor intends to relicense the Licensed Work under the permissive dual **MIT OR Apache-2.0** terms ahead of the Change Date.
+- **Funding intent:** upon receiving grant funding for this work, the licensor intends to relicense under the permissive dual **MIT OR Apache-2.0** terms ahead of the Change Date.
 
-## Build status
-
-Compiles to a **22.2 KB** deployable Stylus contract (under the 24 KB on-chain limit), validated against the live Arbitrum Sepolia network (activation data fee ~0.000149 ETH).
-
-> Keep `Cargo.lock`: it pins `ruint = 1.14.0`. With the resolver's default `ruint 1.18`, `stylus-sdk 0.9.0` fails to compile (a `to_be_bytes::<32>` const-eval panic).
-
-## Build
+## Toolchain
 
 ```bash
-cargo build --release --target wasm32-unknown-unknown
+rustup component add rust-src
+rustup target add wasm32-unknown-unknown
+brew install binaryen        # provides wasm-opt
+cargo install cargo-stylus
 ```
 
-## Test
+> Keep `Cargo.lock`: it pins `ruint = 1.14.0` (else `stylus-sdk 0.9.0` fails to compile against `ruint 1.18`) and `arbitrary = 1.4.1` (else the `cargo test` dependency graph fails to build).
 
-13 behavioral tests (via the `motsu` host VM) cover the compliance guarantees and both hardenings:
+## Test
 
 ```bash
 cargo test
 ```
 
-Coverage includes: role-gated mint/burn/freeze/forced-transfer, send/receive allowlist enforcement, freeze blocking over-unfrozen transfers, `frozen > balance` handling, the F2 hardening (a self-directed `forced_transfer` does not wipe the freeze), and the F3 hardening (`can_transfer` agrees with execution on over-balance amounts). Tests return `Result` and propagate with `?` (no `assert!`/`unwrap`).
+21 behavioral tests via the `motsu` host VM (14 for `urwa20`, 7 for `urwa1155`), covering role-gating, allowlist enforcement, freeze semantics, the duplicate-id batch fix, the self-forced-transfer hardening, and metadata. Tests return `Result` and propagate with `?` (no `assert!`/`unwrap`).
 
-## Validate deployability
+## Build (deployable)
+
+A plain `cargo build --release` exceeds the 24 KB Stylus limit once metadata / ERC-1155 code is included. The deployable build needs build-std with the `immediate-abort` panic strategy plus `wasm-opt`; both are wrapped in:
 
 ```bash
-cargo stylus check \
-  --wasm-file target/wasm32-unknown-unknown/release/urwa_stylus.wasm \
-  --endpoint https://sepolia-rollup.arbitrum.io/rpc
+./scripts/build-release.sh
 ```
 
-The `--wasm-file` flag validates the prebuilt artifact and skips cargo-stylus's `-Z build-std` reproducible rebuild (which is unrelated to deployability and is not needed for testnet).
+This produces `target/wasm32-unknown-unknown/release/urwa20.opt.wasm` and `urwa1155.opt.wasm` and prints each compressed size.
 
 ## Deploy (Arbitrum Sepolia testnet)
 
-Requires a funded Arbitrum Sepolia account (get testnet ETH from an Arbitrum Sepolia faucet). The constructor takes the initial admin address and grants it every role (admin, minter, burner, freezing, whitelist, force-transfer):
+Requires a funded Arbitrum Sepolia account. The constructor grants the initial admin every role (admin, minter, burner, freezing, whitelist, force-transfer).
+
+uRWA-20 (`constructor(string name, string symbol, address admin)`):
 
 ```bash
 cargo stylus deploy \
-  --wasm-file target/wasm32-unknown-unknown/release/urwa_stylus.wasm \
+  --wasm-file target/wasm32-unknown-unknown/release/urwa20.opt.wasm \
+  --constructor-signature "constructor(string,string,address)" \
+  --constructor-args "uRWA Property" "uRWA" <INITIAL_ADMIN_ADDRESS> \
+  --endpoint https://sepolia-rollup.arbitrum.io/rpc \
+  --private-key <YOUR_TESTNET_KEY> \
+  --no-verify
+```
+
+uRWA-1155 (`constructor(address admin)`):
+
+```bash
+cargo stylus deploy \
+  --wasm-file target/wasm32-unknown-unknown/release/urwa1155.opt.wasm \
   --constructor-signature "constructor(address)" \
   --constructor-args <INITIAL_ADMIN_ADDRESS> \
   --endpoint https://sepolia-rollup.arbitrum.io/rpc \
@@ -68,6 +90,7 @@ cargo stylus deploy \
 
 ## Known follow-ups
 
-- ERC-20 metadata (name/symbol/decimals) extension.
-- ERC-721 and ERC-1155 uRWA variants.
-- Migrate off the now-deprecated `stylus_sdk::evm::log` / `msg::sender` helpers to the `.vm()` host API (currently 7 deprecation warnings, non-blocking).
+- ERC-1155 URI metadata extension (uRWA-20 metadata is implemented).
+- ERC-721 uRWA variant.
+- A differential-test harness (Rust vs the Solidity reference).
+- Migrate off the deprecated `stylus_sdk::evm::log` / `msg::sender` helpers to the `.vm()` host API.

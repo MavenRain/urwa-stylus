@@ -22,8 +22,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build contract (wasm32)
-        run: cargo build --locked --release --target wasm32-unknown-unknown --lib
+      - name: Build contracts (wasm32)
+        run: cargo build --locked --release --target wasm32-unknown-unknown --workspace --lib
 
       - name: Test (host VM)
         run: cargo test --locked

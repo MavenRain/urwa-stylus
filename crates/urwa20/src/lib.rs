@@ -15,16 +15,20 @@
 //!     reports `true` for an amount the account cannot actually move (F3).
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use alloy_sol_types::sol;
 use openzeppelin_stylus::{
     access::control::{self, AccessControl, IAccessControl},
-    token::erc20::{self, Erc20, IErc20},
+    token::erc20::{
+        self,
+        extensions::{Erc20Metadata, IErc20Metadata},
+        Erc20, IErc20,
+    },
     utils::introspection::erc165::IErc165,
 };
 use stylus_sdk::{
-    alloy_primitives::{aliases::B32, Address, B256, U256},
+    alloy_primitives::{aliases::B32, Address, B256, U8, U256},
     evm, msg,
     prelude::*,
     storage::{StorageBool, StorageMap, StorageU256},
@@ -106,16 +110,18 @@ pub const FORCE_TRANSFER_ROLE: [u8; 32] =
 struct URWA20 {
     erc20: Erc20,
     access: AccessControl,
+    metadata: Erc20Metadata,
     send_whitelist: StorageMap<Address, StorageBool>,
     receive_whitelist: StorageMap<Address, StorageBool>,
     frozen: StorageMap<Address, StorageU256>,
 }
 
 #[public]
-#[implements(IErc20<Error = Error>, IAccessControl<Error = control::Error>, IErc165)]
+#[implements(IErc20<Error = Error>, IErc20Metadata, IAccessControl<Error = control::Error>, IErc165)]
 impl URWA20 {
     #[constructor]
-    fn constructor(&mut self, initial_admin: Address) {
+    fn constructor(&mut self, name: String, symbol: String, initial_admin: Address) {
+        self.metadata.constructor(name, symbol);
         self.access._grant_role(AccessControl::DEFAULT_ADMIN_ROLE.into(), initial_admin);
         self.access._grant_role(MINTER_ROLE.into(), initial_admin);
         self.access._grant_role(BURNER_ROLE.into(), initial_admin);
@@ -287,6 +293,21 @@ impl IErc20 for URWA20 {
 }
 
 #[public]
+impl IErc20Metadata for URWA20 {
+    fn name(&self) -> String {
+        self.metadata.name()
+    }
+
+    fn symbol(&self) -> String {
+        self.metadata.symbol()
+    }
+
+    fn decimals(&self) -> U8 {
+        self.metadata.decimals()
+    }
+}
+
+#[public]
 impl IAccessControl for URWA20 {
     type Error = control::Error;
 
@@ -329,7 +350,9 @@ impl IAccessControl for URWA20 {
 #[public]
 impl IErc165 for URWA20 {
     fn supports_interface(&self, interface_id: B32) -> bool {
-        self.access.supports_interface(interface_id) || self.erc20.supports_interface(interface_id)
+        self.access.supports_interface(interface_id)
+            || self.erc20.supports_interface(interface_id)
+            || self.metadata.supports_interface(interface_id)
     }
 }
 
@@ -369,7 +392,7 @@ mod tests {
         admin: Address,
         who: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("uRWA Test".into(), "URWA".into(), admin);
         contract.sender(admin).change_send_whitelist(who, true).ortest("send wl")?;
         contract.sender(admin).change_receive_whitelist(who, true).ortest("recv wl")?;
         Ok(())
@@ -377,7 +400,7 @@ mod tests {
 
     #[motsu::test]
     fn constructor_grants_all_roles(contract: Contract<URWA20>, admin: Address) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("uRWA Test".into(), "URWA".into(), admin);
         let c = contract.sender(admin);
         ensure(c.has_role(MINTER_ROLE.into(), admin), "MINTER")?;
         ensure(c.has_role(BURNER_ROLE.into(), admin), "BURNER")?;
@@ -385,6 +408,15 @@ mod tests {
         ensure(c.has_role(WHITELIST_ROLE.into(), admin), "WHITELIST")?;
         ensure(c.has_role(FORCE_TRANSFER_ROLE.into(), admin), "FORCE_TRANSFER")?;
         ensure(c.has_role(AccessControl::DEFAULT_ADMIN_ROLE.into(), admin), "DEFAULT_ADMIN")?;
+        Ok(())
+    }
+
+    #[motsu::test]
+    fn metadata_is_set(contract: Contract<URWA20>, admin: Address) -> Result<(), TestErr> {
+        contract.sender(admin).constructor("uRWA Real Estate".into(), "uRWA".into(), admin);
+        ensure(contract.sender(admin).name() == "uRWA Real Estate", "name")?;
+        ensure(contract.sender(admin).symbol() == "uRWA", "symbol")?;
+        ensure(contract.sender(admin).decimals() == U8::from(18), "decimals 18")?;
         Ok(())
     }
 
@@ -411,7 +443,7 @@ mod tests {
         holder: Address,
         dest: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("uRWA Test".into(), "URWA".into(), admin);
         // holder can receive (so it can be minted to) but is NOT send-allowlisted.
         contract.sender(admin).change_receive_whitelist(holder, true).ortest("recv wl")?;
         setup_allowlisted(&contract, admin, dest)?;
@@ -554,7 +586,7 @@ mod tests {
         admin: Address,
         holder: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("uRWA Test".into(), "URWA".into(), admin);
         // holder not allowlisted yet: mint must fail.
         ensure(contract.sender(admin).mint(holder, n(100)).is_err(), "mint to non-allowlisted reverts")?;
         contract.sender(admin).change_receive_whitelist(holder, true).ortest("recv wl")?;

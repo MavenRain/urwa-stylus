@@ -1,0 +1,26 @@
+[package]
+name = "urwa20"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ERC-7943 (uRWA) fungible Real World Asset token for Arbitrum Stylus"
+
+[dependencies]
+openzeppelin-stylus.workspace = true
+stylus-sdk.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+keccak-const.workspace = true
+
+[dev-dependencies]
+motsu.workspace = true
+
+[features]
+export-abi = ["openzeppelin-stylus/export-abi", "stylus-sdk/export-abi"]
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "urwa20"
+path = "src/main.rs"
