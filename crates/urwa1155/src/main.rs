@@ -6,5 +6,5 @@ pub extern "C" fn main() {}
 
 #[cfg(feature = "export-abi")]
 fn main() {
-    urwa_stylus::print_from_args();
+    urwa1155::print_from_args();
 }
