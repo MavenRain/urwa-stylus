@@ -14,12 +14,16 @@
 //! destination failing to implement `onERC721Received`.
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use alloy_sol_types::sol;
 use openzeppelin_stylus::{
     access::control::{self, AccessControl, IAccessControl},
-    token::erc721::{self, Erc721, IErc721},
+    token::erc721::{
+        self,
+        extensions::{Erc721Metadata, IErc721Metadata},
+        Erc721, IErc721,
+    },
     utils::introspection::erc165::IErc165,
 };
 use stylus_sdk::{
@@ -117,16 +121,19 @@ fn empty_data() -> Bytes {
 struct URWA721 {
     erc721: Erc721,
     access: AccessControl,
+    metadata: Erc721Metadata,
     send_whitelist: StorageMap<Address, StorageBool>,
     receive_whitelist: StorageMap<Address, StorageBool>,
     frozen: StorageMap<Address, StorageMap<U256, StorageBool>>,
 }
 
 #[public]
-#[implements(IErc721<Error = Error>, IAccessControl<Error = control::Error>, IErc165)]
+#[implements(IErc721<Error = Error>, IErc721Metadata<Error = Error>, IAccessControl<Error = control::Error>, IErc165)]
 impl URWA721 {
     #[constructor]
-    fn constructor(&mut self, initial_admin: Address) {
+    fn constructor(&mut self, name: String, symbol: String, base_uri: String, initial_admin: Address) {
+        self.metadata.constructor(name, symbol);
+        self.metadata.base_uri.set_str(base_uri);
         self.access._grant_role(AccessControl::DEFAULT_ADMIN_ROLE.into(), initial_admin);
         self.access._grant_role(MINTER_ROLE.into(), initial_admin);
         self.access._grant_role(BURNER_ROLE.into(), initial_admin);
@@ -305,6 +312,24 @@ impl IErc721 for URWA721 {
 }
 
 #[public]
+impl IErc721Metadata for URWA721 {
+    type Error = Error;
+
+    fn name(&self) -> String {
+        self.metadata.name()
+    }
+
+    fn symbol(&self) -> String {
+        self.metadata.symbol()
+    }
+
+    #[selector(name = "tokenURI")]
+    fn token_uri(&self, token_id: U256) -> Result<String, Error> {
+        Ok(self.metadata.token_uri(token_id, &self.erc721)?)
+    }
+}
+
+#[public]
 impl IAccessControl for URWA721 {
     type Error = control::Error;
 
@@ -347,7 +372,9 @@ impl IAccessControl for URWA721 {
 #[public]
 impl IErc165 for URWA721 {
     fn supports_interface(&self, interface_id: B32) -> bool {
-        self.access.supports_interface(interface_id) || self.erc721.supports_interface(interface_id)
+        self.access.supports_interface(interface_id)
+            || self.erc721.supports_interface(interface_id)
+            || <Self as IErc721Metadata>::interface_id() == interface_id
     }
 }
 
@@ -384,7 +411,7 @@ mod tests {
         admin: Address,
         who: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin);
         contract.sender(admin).change_send_whitelist(who, true).ortest("send wl")?;
         contract.sender(admin).change_receive_whitelist(who, true).ortest("recv wl")?;
         Ok(())
@@ -392,10 +419,25 @@ mod tests {
 
     #[motsu::test]
     fn constructor_grants_roles(contract: Contract<URWA721>, admin: Address) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin);
         let c = contract.sender(admin);
         ensure(c.has_role(MINTER_ROLE.into(), admin), "MINTER")?;
         ensure(c.has_role(FORCE_TRANSFER_ROLE.into(), admin), "FORCE")?;
+        Ok(())
+    }
+
+    #[motsu::test]
+    fn metadata_name_symbol_and_token_uri(
+        contract: Contract<URWA721>,
+        admin: Address,
+        holder: Address,
+    ) -> Result<(), TestErr> {
+        setup_allowlisted(&contract, admin, holder)?;
+        ensure(contract.sender(admin).name() == "uRWA Deed", "name")?;
+        ensure(contract.sender(admin).symbol() == "DEED", "symbol")?;
+        contract.sender(admin).safe_mint(holder, n(TOKEN)).ortest("mint")?;
+        // base_uri + tokenId
+        ensure(contract.sender(admin).token_uri(n(TOKEN)).ortest("token_uri")? == "ipfs://deeds/1", "tokenURI")?;
         Ok(())
     }
 
@@ -406,7 +448,7 @@ mod tests {
         holder: Address,
         mallory: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin);
         // not receive-allowlisted yet
         ensure(contract.sender(admin).safe_mint(holder, n(TOKEN)).is_err(), "mint to non-allowlisted reverts")?;
         contract.sender(admin).change_receive_whitelist(holder, true).ortest("recv wl")?;

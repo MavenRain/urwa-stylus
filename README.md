@@ -8,9 +8,9 @@ RWA compliance checks (allowlists, freeze accounting) run on every transfer, min
 
 | Crate | Standard | ERC-7943 surface | Compressed size |
 |-------|----------|------------------|-----------------|
-| [`urwa20`](crates/urwa20) | ERC-20 (+ metadata) | fungible (fractional shares) | 17.3 KB |
-| [`urwa721`](crates/urwa721) | ERC-721 | non-fungible (deed / title) | 16.8 KB |
-| [`urwa1155`](crates/urwa1155) | ERC-1155 | multi-token | 20.8 KB |
+| [`urwa20`](crates/urwa20) | ERC-20 + metadata | fungible (fractional shares) | 17.3 KB |
+| [`urwa721`](crates/urwa721) | ERC-721 + metadata | non-fungible (deed / title) | 23.3 KB |
+| [`urwa1155`](crates/urwa1155) | ERC-1155 + metadata URI | multi-token | 24.0 KB |
 
 Both are under the 24 KB compressed Stylus limit and were validated against the live Arbitrum Sepolia network (`cargo stylus check`).
 
@@ -50,7 +50,7 @@ cargo install cargo-stylus
 cargo test
 ```
 
-29 behavioral tests via the `motsu` host VM (14 for `urwa20`, 8 for `urwa721`, 7 for `urwa1155`), covering role-gating, allowlist enforcement, freeze semantics, the duplicate-id batch fix, the self-forced-transfer hardening, forced-transfer ownership checks, and metadata. Tests return `Result` and propagate with `?` (no `assert!`/`unwrap`).
+31 behavioral tests via the `motsu` host VM (14 for `urwa20`, 9 for `urwa721`, 8 for `urwa1155`), covering role-gating, allowlist enforcement, freeze semantics, the duplicate-id batch fix, the self-forced-transfer hardening, forced-transfer ownership checks, and metadata. Tests return `Result` and propagate with `?` (no `assert!`/`unwrap`).
 
 ## Build (deployable)
 
@@ -78,25 +78,25 @@ cargo stylus deploy \
   --no-verify
 ```
 
-uRWA-1155 (`constructor(address admin)`):
+uRWA-1155 (`constructor(string uri, address admin)`):
 
 ```bash
 cargo stylus deploy \
   --wasm-file target/wasm32-unknown-unknown/release/urwa1155.opt.wasm \
-  --constructor-signature "constructor(address)" \
-  --constructor-args <INITIAL_ADMIN_ADDRESS> \
+  --constructor-signature "constructor(string,address)" \
+  --constructor-args "ipfs://your-cdn/{id}.json" <INITIAL_ADMIN_ADDRESS> \
   --endpoint https://sepolia-rollup.arbitrum.io/rpc \
   --private-key <YOUR_TESTNET_KEY> \
   --no-verify
 ```
 
-uRWA-721 (`constructor(address admin)`):
+uRWA-721 (`constructor(string name, string symbol, string baseURI, address admin)`):
 
 ```bash
 cargo stylus deploy \
   --wasm-file target/wasm32-unknown-unknown/release/urwa721.opt.wasm \
-  --constructor-signature "constructor(address)" \
-  --constructor-args <INITIAL_ADMIN_ADDRESS> \
+  --constructor-signature "constructor(string,string,string,address)" \
+  --constructor-args "uRWA Deed" "DEED" "ipfs://your-cdn/deeds/" <INITIAL_ADMIN_ADDRESS> \
   --endpoint https://sepolia-rollup.arbitrum.io/rpc \
   --private-key <YOUR_TESTNET_KEY> \
   --no-verify
@@ -104,6 +104,6 @@ cargo stylus deploy \
 
 ## Known follow-ups
 
-- Name / symbol / token-URI metadata for `urwa721` and `urwa1155` (uRWA-20 metadata is implemented).
 - A differential-test harness (Rust vs the Solidity reference).
+- `urwa1155` omits `mintBatch` / `burnBatch` (not interface methods) so the URI metadata fits under the 24 KB limit (it lands at 24.0 KB). Restore them by trimming elsewhere if batch mint/burn is needed.
 - Migrate off the deprecated `stylus_sdk::evm::log` / `msg::sender` helpers to the `.vm()` host API.
