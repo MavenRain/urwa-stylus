@@ -575,4 +575,314 @@ mod tests {
         ensure(contract.sender(holder).can_transfer(holder, dest, n(ID), n(50)), "exact true")?;
         Ok(())
     }
+
+    // ---------------------------------------------------------------------------------
+    // Differential harness: real uRWA1155 (via motsu) vs a faithful Rust model of the
+    // Solidity reference `uRWA1155.sol`. A seeded random op-sequence is applied to both and
+    // they must agree on success/revert and state at every step. The walk only generates
+    // DISTINCT-id batches (the equivalence region); the duplicate-id batch divergence (the
+    // reference's frozen-bypass bug, fixed here) is asserted explicitly afterwards.
+    // ---------------------------------------------------------------------------------
+
+    use alloc::collections::{BTreeMap, BTreeSet};
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Op {
+        SetSendWl { acct: Address, status: bool, by: Address },
+        SetRecvWl { acct: Address, status: bool, by: Address },
+        Mint { to: Address, id: u64, amt: u128, by: Address },
+        Freeze { acct: Address, id: u64, amt: u128, by: Address },
+        SetApproval { owner: Address, operator: Address, approved: bool },
+        Transfer { from: Address, to: Address, id: u64, amt: u128, by: Address },
+        Batch { from: Address, to: Address, id1: u64, id2: u64, amt1: u128, amt2: u128, by: Address },
+        Burn { id: u64, amt: u128, by: Address },
+        ForcedTransfer { from: Address, to: Address, id: u64, amt: u128, by: Address },
+    }
+
+    /// Faithful model of the Solidity reference `uRWA1155`. Only `admin` holds roles.
+    struct Ref1155 {
+        admin: Address,
+        bal: BTreeMap<(Address, u64), u128>,
+        frozen: BTreeMap<(Address, u64), u128>,
+        approval: BTreeSet<(Address, Address)>,
+        send: BTreeSet<Address>,
+        recv: BTreeSet<Address>,
+    }
+
+    impl Ref1155 {
+        fn new(admin: Address) -> Self {
+            Ref1155 {
+                admin,
+                bal: BTreeMap::new(),
+                frozen: BTreeMap::new(),
+                approval: BTreeSet::new(),
+                send: BTreeSet::new(),
+                recv: BTreeSet::new(),
+            }
+        }
+        fn b(&self, a: Address, id: u64) -> u128 {
+            *self.bal.get(&(a, id)).unwrap_or(&0)
+        }
+        fn f(&self, a: Address, id: u64) -> u128 {
+            *self.frozen.get(&(a, id)).unwrap_or(&0)
+        }
+        fn unfrozen(&self, a: Address, id: u64) -> u128 {
+            let (bal, frz) = (self.b(a, id), self.f(a, id));
+            if bal < frz { 0 } else { bal - frz }
+        }
+        fn authed(&self, from: Address, by: Address) -> bool {
+            by == from || self.approval.contains(&(from, by))
+        }
+        fn excess_frozen_update(&mut self, a: Address, id: u64, amt: u128) {
+            let unfrozen = self.unfrozen(a, id);
+            let bal = self.b(a, id);
+            if amt > unfrozen && amt <= bal {
+                let next = self.f(a, id) - (amt - unfrozen);
+                self.frozen.insert((a, id), next);
+            }
+        }
+        /// The reference's per-element batch check: each element is validated against the
+        /// SAME un-decremented unfrozen balance, so repeating an id lets the total exceed it.
+        fn reference_per_element_batch_ok(&self, from: Address, id: u64, amts: &[u128]) -> bool {
+            amts.iter().all(|&amt| amt <= self.unfrozen(from, id))
+        }
+        fn apply(&mut self, op: Op) -> bool {
+            match op {
+                Op::SetSendWl { acct, status, by } => {
+                    if by != self.admin {
+                        false
+                    } else {
+                        if status { self.send.insert(acct); } else { self.send.remove(&acct); }
+                        true
+                    }
+                }
+                Op::SetRecvWl { acct, status, by } => {
+                    if by != self.admin {
+                        false
+                    } else {
+                        if status { self.recv.insert(acct); } else { self.recv.remove(&acct); }
+                        true
+                    }
+                }
+                Op::Mint { to, id, amt, by } => {
+                    if by != self.admin || !self.recv.contains(&to) {
+                        false
+                    } else {
+                        self.bal.insert((to, id), self.b(to, id) + amt);
+                        true
+                    }
+                }
+                Op::Freeze { acct, id, amt, by } => {
+                    if by != self.admin {
+                        false
+                    } else {
+                        self.frozen.insert((acct, id), amt);
+                        true
+                    }
+                }
+                Op::SetApproval { owner, operator, approved } => {
+                    if approved { self.approval.insert((owner, operator)); } else { self.approval.remove(&(owner, operator)); }
+                    true
+                }
+                Op::Transfer { from, to, id, amt, by } => {
+                    if !self.authed(from, by)
+                        || !self.send.contains(&from)
+                        || !self.recv.contains(&to)
+                        || amt > self.unfrozen(from, id)
+                    {
+                        false
+                    } else {
+                        self.bal.insert((from, id), self.b(from, id) - amt);
+                        self.bal.insert((to, id), self.b(to, id) + amt);
+                        true
+                    }
+                }
+                Op::Batch { from, to, id1, id2, amt1, amt2, by } => {
+                    // generator guarantees id1 != id2 (distinct), so per-element == accumulated.
+                    if !self.authed(from, by)
+                        || !self.send.contains(&from)
+                        || !self.recv.contains(&to)
+                        || amt1 > self.unfrozen(from, id1)
+                        || amt2 > self.unfrozen(from, id2)
+                    {
+                        false
+                    } else {
+                        self.bal.insert((from, id1), self.b(from, id1) - amt1);
+                        self.bal.insert((to, id1), self.b(to, id1) + amt1);
+                        self.bal.insert((from, id2), self.b(from, id2) - amt2);
+                        self.bal.insert((to, id2), self.b(to, id2) + amt2);
+                        true
+                    }
+                }
+                Op::Burn { id, amt, by } => {
+                    if by != self.admin || !self.send.contains(&by) || self.b(by, id) < amt {
+                        false
+                    } else {
+                        self.excess_frozen_update(by, id, amt);
+                        self.bal.insert((by, id), self.b(by, id) - amt);
+                        true
+                    }
+                }
+                Op::ForcedTransfer { from, to, id, amt, by } => {
+                    // generator guarantees from != to.
+                    if by != self.admin || !self.recv.contains(&to) || self.b(from, id) < amt {
+                        false
+                    } else {
+                        self.excess_frozen_update(from, id, amt);
+                        self.bal.insert((from, id), self.b(from, id) - amt);
+                        self.bal.insert((to, id), self.b(to, id) + amt);
+                        true
+                    }
+                }
+            }
+        }
+    }
+
+    fn gen_op(rng: &mut Lcg, actors: &[Address; 4]) -> Op {
+        let admin = actors[0];
+        let amt = rng.below(120) as u128;
+        let id = rng.below(3);
+        let by = if rng.below(5) == 0 { actors[rng.below(4) as usize] } else { admin };
+        let from = actors[rng.below(4) as usize];
+        // transfer sender: usually `from`, occasionally another actor (exercises operator auth).
+        let tby = if rng.below(3) == 0 { actors[rng.below(4) as usize] } else { from };
+        match rng.below(9) {
+            0 => Op::SetSendWl { acct: actors[rng.below(4) as usize], status: rng.below(2) == 1, by },
+            1 => Op::SetRecvWl { acct: actors[rng.below(4) as usize], status: rng.below(2) == 1, by },
+            2 => Op::Mint { to: actors[rng.below(4) as usize], id, amt, by },
+            3 => Op::Freeze { acct: actors[rng.below(4) as usize], id, amt, by },
+            4 => Op::SetApproval {
+                owner: actors[rng.below(4) as usize],
+                operator: actors[rng.below(4) as usize],
+                approved: rng.below(2) == 1,
+            },
+            5 => Op::Transfer { from, to: actors[rng.below(4) as usize], id, amt, by: tby },
+            6 => {
+                let id2 = (id + 1 + rng.below(2)) % 3; // distinct from id
+                Op::Batch { from, to: actors[rng.below(4) as usize], id1: id, id2, amt1: amt, amt2: rng.below(120) as u128, by: tby }
+            }
+            7 => Op::Burn { id, amt, by },
+            _ => {
+                let fi = rng.below(4) as usize;
+                let ti0 = rng.below(4) as usize;
+                let ti = if ti0 == fi { (fi + 1) % 4 } else { ti0 };
+                Op::ForcedTransfer { from: actors[fi], to: actors[ti], id, amt, by }
+            }
+        }
+    }
+
+    fn apply_real(c: &Contract<URWA1155>, op: Op) -> bool {
+        match op {
+            Op::SetSendWl { acct, status, by } => c.sender(by).change_send_whitelist(acct, status).is_ok(),
+            Op::SetRecvWl { acct, status, by } => c.sender(by).change_receive_whitelist(acct, status).is_ok(),
+            Op::Mint { to, id, amt, by } => c.sender(by).mint(to, U256::from(id), U256::from(amt)).is_ok(),
+            Op::Freeze { acct, id, amt, by } => {
+                c.sender(by).set_frozen_tokens(acct, U256::from(id), U256::from(amt)).is_ok()
+            }
+            Op::SetApproval { owner, operator, approved } => {
+                c.sender(owner).set_approval_for_all(operator, approved).is_ok()
+            }
+            Op::Transfer { from, to, id, amt, by } => c
+                .sender(by)
+                .safe_transfer_from(from, to, U256::from(id), U256::from(amt), Vec::new().into())
+                .is_ok(),
+            Op::Batch { from, to, id1, id2, amt1, amt2, by } => {
+                let ids = alloc::vec![U256::from(id1), U256::from(id2)];
+                let vals = alloc::vec![U256::from(amt1), U256::from(amt2)];
+                c.sender(by).safe_batch_transfer_from(from, to, ids, vals, Vec::new().into()).is_ok()
+            }
+            Op::Burn { id, amt, by } => c.sender(by).burn(U256::from(id), U256::from(amt)).is_ok(),
+            Op::ForcedTransfer { from, to, id, amt, by } => {
+                c.sender(by).forced_transfer(from, to, U256::from(id), U256::from(amt)).is_ok()
+            }
+        }
+    }
+
+    fn compare(c: &Contract<URWA1155>, m: &Ref1155, actors: &[Address; 4]) -> Result<(), TestErr> {
+        actors.iter().try_for_each(|&a| {
+            (0u64..3).try_for_each(|id| {
+                ensure(c.sender(actors[0]).balance_of(a, U256::from(id)) == U256::from(m.b(a, id)), "balance mismatch")?;
+                ensure(
+                    c.sender(actors[0]).get_frozen_tokens(a, U256::from(id)) == U256::from(m.f(a, id)),
+                    "frozen mismatch",
+                )
+            })
+        })?;
+        actors.iter().try_for_each(|&owner| {
+            actors.iter().try_for_each(|&operator| {
+                ensure(
+                    c.sender(actors[0]).is_approved_for_all(owner, operator) == m.approval.contains(&(owner, operator)),
+                    "approval mismatch",
+                )
+            })
+        })
+    }
+
+    #[motsu::test]
+    fn differential_vs_reference_model(
+        contract: Contract<URWA1155>,
+        admin: Address,
+        a: Address,
+        b: Address,
+        c: Address,
+    ) -> Result<(), TestErr> {
+        contract.sender(admin).constructor("ipfs://{id}".into(), admin);
+        let actors = [admin, a, b, c];
+        let mut model = Ref1155::new(admin);
+        let mut rng = Lcg::new(0xD1CE_F00D_C0FF_EE01);
+        (0..700u64).try_for_each(|_| {
+            let op = gen_op(&mut rng, &actors);
+            let real_ok = apply_real(&contract, op);
+            let model_ok = model.apply(op);
+            ensure(real_ok == model_ok, "success/revert divergence vs reference")?;
+            compare(&contract, &model, &actors)
+        })
+    }
+
+    /// The headline: the harness catches the reference's duplicate-id batch frozen-bypass.
+    /// The reference's per-element check would allow a [id,id] batch to drain a frozen
+    /// position; the hardened contract reverts.
+    #[motsu::test]
+    fn differential_flags_duplicate_id_batch_divergence(
+        contract: Contract<URWA1155>,
+        admin: Address,
+        holder: Address,
+        dest: Address,
+    ) -> Result<(), TestErr> {
+        setup_allowlisted(&contract, admin, holder)?;
+        setup_allowlisted(&contract, admin, dest)?;
+        contract.sender(admin).mint(holder, n(1), n(100)).ortest("mint")?;
+        contract.sender(admin).set_frozen_tokens(holder, n(1), n(50)).ortest("freeze 50")?;
+
+        // The reference validates each [50, 50] element against the un-decremented unfrozen 50,
+        // so both pass and it would move the full 100 (draining the frozen half).
+        let mut model = Ref1155::new(admin);
+        model.bal.insert((holder, 1), 100);
+        model.frozen.insert((holder, 1), 50);
+        ensure(model.reference_per_element_batch_ok(holder, 1, &[50, 50]), "reference would allow the drain")?;
+
+        // The hardened contract accumulates per id and reverts; nothing moves.
+        let ids = alloc::vec![n(1), n(1)];
+        let vals = alloc::vec![n(50), n(50)];
+        ensure(
+            contract.sender(holder).safe_batch_transfer_from(holder, dest, ids, vals, Vec::new().into()).is_err(),
+            "contract reverts the duplicate-id drain",
+        )?;
+        ensure(contract.sender(admin).balance_of(holder, n(1)) == n(100), "holder keeps all 100")?;
+        Ok(())
+    }
 }
