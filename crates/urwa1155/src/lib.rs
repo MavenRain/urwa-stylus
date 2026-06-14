@@ -15,12 +15,16 @@
 //! not corrupt freeze accounting, and `can_transfer` reflects true feasibility.
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use alloy_sol_types::sol;
 use openzeppelin_stylus::{
     access::control::{self, AccessControl, IAccessControl},
-    token::erc1155::{self, Erc1155, IErc1155},
+    token::erc1155::{
+        self,
+        extensions::{Erc1155MetadataUri, IErc1155MetadataUri},
+        Erc1155, IErc1155,
+    },
     utils::introspection::erc165::IErc165,
 };
 use stylus_sdk::{
@@ -116,16 +120,18 @@ fn empty_data() -> Bytes {
 struct URWA1155 {
     erc1155: Erc1155,
     access: AccessControl,
+    metadata: Erc1155MetadataUri,
     send_whitelist: StorageMap<Address, StorageBool>,
     receive_whitelist: StorageMap<Address, StorageBool>,
     frozen: StorageMap<Address, StorageMap<U256, StorageU256>>,
 }
 
 #[public]
-#[implements(IErc1155<Error = Error>, IAccessControl<Error = control::Error>, IErc165)]
+#[implements(IErc1155<Error = Error>, IErc1155MetadataUri, IAccessControl<Error = control::Error>, IErc165)]
 impl URWA1155 {
     #[constructor]
-    fn constructor(&mut self, initial_admin: Address) {
+    fn constructor(&mut self, uri: String, initial_admin: Address) {
+        self.metadata.constructor(uri);
         self.access._grant_role(AccessControl::DEFAULT_ADMIN_ROLE.into(), initial_admin);
         self.access._grant_role(MINTER_ROLE.into(), initial_admin);
         self.access._grant_role(BURNER_ROLE.into(), initial_admin);
@@ -180,16 +186,6 @@ impl URWA1155 {
         Ok(())
     }
 
-    /// Batched [`mint`]. Requires `MINTER_ROLE` and `to` on the receive-allowlist.
-    fn mint_batch(&mut self, to: Address, ids: Vec<U256>, amounts: Vec<U256>) -> Result<(), Error> {
-        self.access.only_role(MINTER_ROLE.into())?;
-        self.can_receive(to)
-            .then_some(())
-            .ok_or(Error::CannotReceive(ERC7943CannotReceive { account: to }))?;
-        self.erc1155._mint_batch(to, ids, amounts, &empty_data())?;
-        Ok(())
-    }
-
     /// Burn `amount` of `id` from the caller. Requires `BURNER_ROLE` and caller on the send-allowlist.
     fn burn(&mut self, id: U256, amount: U256) -> Result<(), Error> {
         self.access.only_role(BURNER_ROLE.into())?;
@@ -199,20 +195,6 @@ impl URWA1155 {
             .ok_or(Error::CannotSend(ERC7943CannotSend { account: from }))?;
         self.excess_frozen_update(from, id, amount);
         self.erc1155._burn(from, id, amount)?;
-        Ok(())
-    }
-
-    /// Batched [`burn`]. Requires `BURNER_ROLE` and caller on the send-allowlist.
-    fn burn_batch(&mut self, ids: Vec<U256>, amounts: Vec<U256>) -> Result<(), Error> {
-        self.access.only_role(BURNER_ROLE.into())?;
-        let from = msg::sender();
-        self.can_send(from)
-            .then_some(())
-            .ok_or(Error::CannotSend(ERC7943CannotSend { account: from }))?;
-        ids.iter()
-            .zip(amounts.iter())
-            .for_each(|(&id, &amount)| self.excess_frozen_update(from, id, amount));
-        self.erc1155._burn_batch(from, ids, amounts)?;
         Ok(())
     }
 
@@ -355,6 +337,13 @@ impl IErc1155 for URWA1155 {
 }
 
 #[public]
+impl IErc1155MetadataUri for URWA1155 {
+    fn uri(&self, id: U256) -> String {
+        self.metadata.uri(id)
+    }
+}
+
+#[public]
 impl IAccessControl for URWA1155 {
     type Error = control::Error;
 
@@ -397,7 +386,9 @@ impl IAccessControl for URWA1155 {
 #[public]
 impl IErc165 for URWA1155 {
     fn supports_interface(&self, interface_id: B32) -> bool {
-        self.access.supports_interface(interface_id) || self.erc1155.supports_interface(interface_id)
+        self.access.supports_interface(interface_id)
+            || self.erc1155.supports_interface(interface_id)
+            || <Self as IErc1155MetadataUri>::interface_id() == interface_id
     }
 }
 
@@ -434,7 +425,7 @@ mod tests {
         admin: Address,
         who: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("ipfs://props/{id}.json".into(), admin);
         contract.sender(admin).change_send_whitelist(who, true).ortest("send wl")?;
         contract.sender(admin).change_receive_whitelist(who, true).ortest("recv wl")?;
         Ok(())
@@ -454,6 +445,14 @@ mod tests {
         ensure(contract.sender(holder).safe_transfer_from(holder, dest, n(ID), n(60), Vec::new().into()).is_err(), "60 reverts")?;
         contract.sender(holder).safe_transfer_from(holder, dest, n(ID), n(50), Vec::new().into()).ortest("50 ok")?;
         ensure(contract.sender(admin).balance_of(holder, n(ID)) == n(50), "holder 50")?;
+        Ok(())
+    }
+
+    #[motsu::test]
+    fn uri_returns_template_for_all_ids(contract: Contract<URWA1155>, admin: Address) -> Result<(), TestErr> {
+        contract.sender(admin).constructor("ipfs://props/{id}.json".into(), admin);
+        ensure(contract.sender(admin).uri(n(1)) == "ipfs://props/{id}.json", "uri id 1")?;
+        ensure(contract.sender(admin).uri(n(999)) == "ipfs://props/{id}.json", "uri same for all ids")?;
         Ok(())
     }
 
@@ -512,7 +511,7 @@ mod tests {
         holder: Address,
         dest: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor(admin);
+        contract.sender(admin).constructor("ipfs://props/{id}.json".into(), admin);
         contract.sender(admin).change_receive_whitelist(holder, true).ortest("holder recv")?;
         contract.sender(admin).mint(holder, n(ID), n(100)).ortest("mint")?;
         // holder not send-allowlisted, dest not receive-allowlisted.
