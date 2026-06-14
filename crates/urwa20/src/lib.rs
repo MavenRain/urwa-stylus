@@ -630,4 +630,282 @@ mod tests {
         ensure(contract.sender(holder).transfer(dest, n(1)).is_err(), "even 1 reverts")?;
         Ok(())
     }
+
+    // ---------------------------------------------------------------------------------
+    // Differential harness: the real uRWA20 (run via motsu) vs a faithful Rust model of
+    // the Solidity reference `uRWA20.sol`. A seeded random op-sequence is applied to both;
+    // they must agree on success/revert and resulting state at every step. The walk stays
+    // in the "equivalence region" (it never generates a self-directed forced transfer, the
+    // one documented hardening); that divergence is asserted explicitly afterwards.
+    // ---------------------------------------------------------------------------------
+
+    use alloc::collections::{BTreeMap, BTreeSet};
+
+    /// Tiny deterministic LCG so runs are reproducible without an external rng dependency.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Op {
+        SetSendWl { acct: Address, status: bool, by: Address },
+        SetRecvWl { acct: Address, status: bool, by: Address },
+        Mint { to: Address, amt: u128, by: Address },
+        Freeze { acct: Address, amt: u128, by: Address },
+        Transfer { from: Address, to: Address, amt: u128 },
+        TransferFrom { spender: Address, from: Address, to: Address, amt: u128 },
+        Approve { owner: Address, spender: Address, amt: u128 },
+        ForcedTransfer { from: Address, to: Address, amt: u128, by: Address },
+        Burn { amt: u128, by: Address },
+    }
+
+    /// Faithful model of the Solidity reference `uRWA20`. Only `admin` holds roles.
+    struct Ref20 {
+        admin: Address,
+        bal: BTreeMap<Address, u128>,
+        frozen: BTreeMap<Address, u128>,
+        allow: BTreeMap<(Address, Address), u128>,
+        send: BTreeSet<Address>,
+        recv: BTreeSet<Address>,
+    }
+
+    impl Ref20 {
+        fn new(admin: Address) -> Self {
+            Ref20 {
+                admin,
+                bal: BTreeMap::new(),
+                frozen: BTreeMap::new(),
+                allow: BTreeMap::new(),
+                send: BTreeSet::new(),
+                recv: BTreeSet::new(),
+            }
+        }
+        fn b(&self, a: Address) -> u128 {
+            *self.bal.get(&a).unwrap_or(&0)
+        }
+        fn f(&self, a: Address) -> u128 {
+            *self.frozen.get(&a).unwrap_or(&0)
+        }
+        fn unfrozen(&self, a: Address) -> u128 {
+            let (bal, frz) = (self.b(a), self.f(a));
+            if bal < frz { 0 } else { bal - frz }
+        }
+        fn allowance(&self, owner: Address, spender: Address) -> u128 {
+            *self.allow.get(&(owner, spender)).unwrap_or(&0)
+        }
+        /// The reference's `_excessFrozenUpdate`: reduce frozen by the amount leaving beyond unfrozen.
+        fn excess_frozen_update(&mut self, a: Address, amt: u128) {
+            let unfrozen = self.unfrozen(a);
+            let bal = self.b(a);
+            if amt > unfrozen && amt <= bal {
+                let next = self.f(a) - (amt - unfrozen);
+                self.frozen.insert(a, next);
+            }
+        }
+        /// Apply `op`; returns whether the Solidity reference would succeed, mutating only on success.
+        fn apply(&mut self, op: Op) -> bool {
+            match op {
+                Op::SetSendWl { acct, status, by } => {
+                    if by != self.admin {
+                        false
+                    } else {
+                        if status { self.send.insert(acct); } else { self.send.remove(&acct); }
+                        true
+                    }
+                }
+                Op::SetRecvWl { acct, status, by } => {
+                    if by != self.admin {
+                        false
+                    } else {
+                        if status { self.recv.insert(acct); } else { self.recv.remove(&acct); }
+                        true
+                    }
+                }
+                Op::Mint { to, amt, by } => {
+                    if by != self.admin || !self.recv.contains(&to) {
+                        false
+                    } else {
+                        self.bal.insert(to, self.b(to) + amt);
+                        true
+                    }
+                }
+                Op::Freeze { acct, amt, by } => {
+                    if by != self.admin {
+                        false
+                    } else {
+                        self.frozen.insert(acct, amt);
+                        true
+                    }
+                }
+                Op::Transfer { from, to, amt } => {
+                    if amt > self.unfrozen(from) || !self.send.contains(&from) || !self.recv.contains(&to) {
+                        false
+                    } else {
+                        self.bal.insert(from, self.b(from) - amt);
+                        self.bal.insert(to, self.b(to) + amt);
+                        true
+                    }
+                }
+                Op::TransferFrom { spender, from, to, amt } => {
+                    if self.allowance(from, spender) < amt
+                        || amt > self.unfrozen(from)
+                        || !self.send.contains(&from)
+                        || !self.recv.contains(&to)
+                    {
+                        false
+                    } else {
+                        self.allow.insert((from, spender), self.allowance(from, spender) - amt);
+                        self.bal.insert(from, self.b(from) - amt);
+                        self.bal.insert(to, self.b(to) + amt);
+                        true
+                    }
+                }
+                Op::Approve { owner, spender, amt } => {
+                    self.allow.insert((owner, spender), amt);
+                    true
+                }
+                Op::ForcedTransfer { from, to, amt, by } => {
+                    // The generator guarantees from != to (the equivalence region).
+                    if by != self.admin || !self.recv.contains(&to) || self.b(from) < amt {
+                        false
+                    } else {
+                        self.excess_frozen_update(from, amt);
+                        self.bal.insert(from, self.b(from) - amt);
+                        self.bal.insert(to, self.b(to) + amt);
+                        true
+                    }
+                }
+                Op::Burn { amt, by } => {
+                    if by != self.admin || !self.send.contains(&by) || self.b(by) < amt {
+                        false
+                    } else {
+                        self.excess_frozen_update(by, amt);
+                        self.bal.insert(by, self.b(by) - amt);
+                        true
+                    }
+                }
+            }
+        }
+    }
+
+    fn gen_op(rng: &mut Lcg, actors: &[Address; 4]) -> Op {
+        let admin = actors[0];
+        let amt = rng.below(120) as u128;
+        // mostly admin for privileged ops, occasionally a non-admin to exercise role-gating (both revert).
+        let by = if rng.below(5) == 0 { actors[rng.below(4) as usize] } else { admin };
+        match rng.below(9) {
+            0 => Op::SetSendWl { acct: actors[rng.below(4) as usize], status: rng.below(2) == 1, by },
+            1 => Op::SetRecvWl { acct: actors[rng.below(4) as usize], status: rng.below(2) == 1, by },
+            2 => Op::Mint { to: actors[rng.below(4) as usize], amt, by },
+            3 => Op::Freeze { acct: actors[rng.below(4) as usize], amt, by },
+            4 => Op::Transfer { from: actors[rng.below(4) as usize], to: actors[rng.below(4) as usize], amt },
+            5 => Op::Approve { owner: actors[rng.below(4) as usize], spender: actors[rng.below(4) as usize], amt },
+            6 => Op::TransferFrom {
+                spender: actors[rng.below(4) as usize],
+                from: actors[rng.below(4) as usize],
+                to: actors[rng.below(4) as usize],
+                amt,
+            },
+            7 => {
+                let fi = rng.below(4) as usize;
+                let ti0 = rng.below(4) as usize;
+                let ti = if ti0 == fi { (fi + 1) % 4 } else { ti0 };
+                Op::ForcedTransfer { from: actors[fi], to: actors[ti], amt, by }
+            }
+            _ => Op::Burn { amt, by },
+        }
+    }
+
+    fn apply_real(c: &Contract<URWA20>, op: Op) -> bool {
+        match op {
+            Op::SetSendWl { acct, status, by } => c.sender(by).change_send_whitelist(acct, status).is_ok(),
+            Op::SetRecvWl { acct, status, by } => c.sender(by).change_receive_whitelist(acct, status).is_ok(),
+            Op::Mint { to, amt, by } => c.sender(by).mint(to, U256::from(amt)).is_ok(),
+            Op::Freeze { acct, amt, by } => c.sender(by).set_frozen_tokens(acct, U256::from(amt)).is_ok(),
+            Op::Transfer { from, to, amt } => c.sender(from).transfer(to, U256::from(amt)).is_ok(),
+            Op::TransferFrom { spender, from, to, amt } => {
+                c.sender(spender).transfer_from(from, to, U256::from(amt)).is_ok()
+            }
+            Op::Approve { owner, spender, amt } => c.sender(owner).approve(spender, U256::from(amt)).is_ok(),
+            Op::ForcedTransfer { from, to, amt, by } => {
+                c.sender(by).forced_transfer(from, to, U256::from(amt)).is_ok()
+            }
+            Op::Burn { amt, by } => c.sender(by).burn(U256::from(amt)).is_ok(),
+        }
+    }
+
+    fn compare(c: &Contract<URWA20>, m: &Ref20, actors: &[Address; 4]) -> Result<(), TestErr> {
+        actors.iter().try_for_each(|&a| {
+            ensure(c.sender(actors[0]).balance_of(a) == U256::from(m.b(a)), "balance mismatch")?;
+            ensure(c.sender(actors[0]).get_frozen_tokens(a) == U256::from(m.f(a)), "frozen mismatch")?;
+            Ok(())
+        })?;
+        let total: u128 = actors.iter().map(|&a| m.b(a)).sum();
+        ensure(c.sender(actors[0]).total_supply() == U256::from(total), "supply mismatch")?;
+        actors.iter().try_for_each(|&owner| {
+            actors.iter().try_for_each(|&spender| {
+                ensure(
+                    c.sender(actors[0]).allowance(owner, spender) == U256::from(m.allowance(owner, spender)),
+                    "allowance mismatch",
+                )
+            })
+        })
+    }
+
+    #[motsu::test]
+    fn differential_vs_reference_model(
+        contract: Contract<URWA20>,
+        admin: Address,
+        a: Address,
+        b: Address,
+        c: Address,
+    ) -> Result<(), TestErr> {
+        contract.sender(admin).constructor("Diff".into(), "DIF".into(), admin);
+        let actors = [admin, a, b, c];
+        let mut model = Ref20::new(admin);
+        let mut rng = Lcg::new(0x9E3779B97F4A7C15);
+        (0..800u64).try_for_each(|_| {
+            let op = gen_op(&mut rng, &actors);
+            let real_ok = apply_real(&contract, op);
+            let model_ok = model.apply(op);
+            ensure(real_ok == model_ok, "success/revert divergence vs reference")?;
+            compare(&contract, &model, &actors)
+        })
+    }
+
+    /// Demonstrates the harness catching the F2 hardening: at a self-directed forced
+    /// transfer the reference model reduces the freeze, while the hardened contract does not.
+    #[motsu::test]
+    fn differential_flags_self_forced_divergence(
+        contract: Contract<URWA20>,
+        admin: Address,
+        holder: Address,
+    ) -> Result<(), TestErr> {
+        setup_allowlisted(&contract, admin, holder)?;
+        contract.sender(admin).mint(holder, n(100)).ortest("mint")?;
+        contract.sender(admin).set_frozen_tokens(holder, n(80)).ortest("freeze")?;
+
+        // What the Solidity reference does for forcedTransfer(holder, holder, 80): its
+        // _excessFrozenUpdate runs before a no-op move, dropping frozen by (80 - unfrozen 20) = 60.
+        let mut model = Ref20::new(admin);
+        model.bal.insert(holder, 100);
+        model.frozen.insert(holder, 80);
+        model.excess_frozen_update(holder, 80);
+        ensure(model.f(holder) == 20, "reference model would drop frozen to 20")?;
+
+        // The hardened contract makes it a no-op: the freeze is preserved.
+        contract.sender(admin).forced_transfer(holder, holder, n(80)).ortest("self forced")?;
+        ensure(contract.sender(admin).get_frozen_tokens(holder) == n(80), "contract preserves frozen 80")?;
+        Ok(())
+    }
 }

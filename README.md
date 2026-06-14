@@ -50,7 +50,9 @@ cargo install cargo-stylus
 cargo test
 ```
 
-31 behavioral tests via the `motsu` host VM (14 for `urwa20`, 9 for `urwa721`, 8 for `urwa1155`), covering role-gating, allowlist enforcement, freeze semantics, the duplicate-id batch fix, the self-forced-transfer hardening, forced-transfer ownership checks, and metadata. Tests return `Result` and propagate with `?` (no `assert!`/`unwrap`).
+35 behavioral tests via the `motsu` host VM (16 for `urwa20`, 9 for `urwa721`, 10 for `urwa1155`), covering role-gating, allowlist enforcement, freeze semantics, the duplicate-id batch fix, the self-forced-transfer hardening, forced-transfer ownership checks, and metadata. Tests return `Result` and propagate with `?` (no `assert!`/`unwrap`).
+
+`urwa20` and `urwa1155` additionally carry a **differential harness**: a faithful Rust model of the Solidity reference is driven alongside the real contract through a long seeded random op-sequence (800 and 700 steps respectively), asserting identical success/revert and state at every step. Dedicated tests show the harness catching the deliberate divergences (the self-forced-transfer hardening, and the duplicate-id frozen-bypass that this port fixes). The models run in the host VM rather than the EVM; their fidelity to the actual `.sol` source is what makes the comparison meaningful, so it was checked separately.
 
 ## Build (deployable)
 
@@ -104,6 +106,6 @@ cargo stylus deploy \
 
 ## Known follow-ups
 
-- A differential-test harness (Rust vs the Solidity reference).
+- A differential harness for `urwa721` (the ERC-20 and ERC-1155 variants have one).
 - `urwa1155` omits `mintBatch` / `burnBatch` (not interface methods) so the URI metadata fits under the 24 KB limit (it lands at 24.0 KB). Restore them by trimming elsewhere if batch mint/burn is needed.
 - Migrate off the deprecated `stylus_sdk::evm::log` / `msg::sender` helpers to the `.vm()` host API.
