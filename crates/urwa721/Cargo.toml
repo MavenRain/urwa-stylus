@@ -1,9 +1,9 @@
 [package]
-name = "urwa20"
+name = "urwa721"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ERC-7943 (uRWA) fungible Real World Asset token for Arbitrum Stylus"
+description = "ERC-7943 (uRWA) non-fungible (deed/title) Real World Asset implementation for Arbitrum Stylus"
 
 [dependencies]
 openzeppelin-stylus.workspace = true
@@ -25,5 +25,5 @@ export-abi = ["openzeppelin-stylus/export-abi", "stylus-sdk/export-abi"]
 crate-type = ["lib", "cdylib"]
 
 [[bin]]
-name = "urwa20"
+name = "urwa721"
 path = "src/main.rs"

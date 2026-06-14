@@ -8,7 +8,8 @@ RWA compliance checks (allowlists, freeze accounting) run on every transfer, min
 
 | Crate | Standard | ERC-7943 surface | Compressed size |
 |-------|----------|------------------|-----------------|
-| [`urwa20`](crates/urwa20) | ERC-20 (+ metadata) | fungible | 17.3 KB |
+| [`urwa20`](crates/urwa20) | ERC-20 (+ metadata) | fungible (fractional shares) | 17.3 KB |
+| [`urwa721`](crates/urwa721) | ERC-721 | non-fungible (deed / title) | 16.8 KB |
 | [`urwa1155`](crates/urwa1155) | ERC-1155 | multi-token | 20.8 KB |
 
 Both are under the 24 KB compressed Stylus limit and were validated against the live Arbitrum Sepolia network (`cargo stylus check`).
@@ -21,7 +22,8 @@ These close findings from an independent review of the ERC-7943 Solidity referen
 
 - **uRWA1155 `safe_batch_transfer_from`** validates each token id against the *accumulated* amount requested for that id across the whole batch. In the reference, repeating an id in one batch bypasses the per-id frozen check and drains frozen tokens; that bug is absent here (test: `duplicate_id_batch_cannot_bypass_freeze`).
 - **`forced_transfer`** is a no-op when `from == to`, so a self-directed seizure cannot zero the freeze accounting while the holder keeps the tokens.
-- **`can_transfer`** reflects true feasibility (unfrozen balance), so it never disagrees with what an actual transfer does.
+- **`can_transfer`** reflects true feasibility (unfrozen balance / ownership), so it never disagrees with what an actual transfer does.
+- **uRWA721 `forced_transfer`** seizes via the base `_update` with no receiver-acceptance check, so a compliance seizure into an allowlisted custody destination cannot be blocked by that destination failing to implement `onERC721Received`.
 
 ## License
 
@@ -40,7 +42,7 @@ brew install binaryen        # provides wasm-opt
 cargo install cargo-stylus
 ```
 
-> Keep `Cargo.lock`: it pins `ruint = 1.14.0` (else `stylus-sdk 0.9.0` fails to compile against `ruint 1.18`) and `arbitrary = 1.4.1` (else the `cargo test` dependency graph fails to build).
+> No `Cargo.lock` is committed. The two transitive dependencies that would otherwise break the build are pinned exactly in the manifests (`ruint = 1.14.0`, needed by `stylus-sdk 0.9.0`; `arbitrary` / `derive_arbitrary = 1.4.1`, needed by the test build), so a fresh `cargo` resolve always works.
 
 ## Test
 
@@ -48,7 +50,7 @@ cargo install cargo-stylus
 cargo test
 ```
 
-21 behavioral tests via the `motsu` host VM (14 for `urwa20`, 7 for `urwa1155`), covering role-gating, allowlist enforcement, freeze semantics, the duplicate-id batch fix, the self-forced-transfer hardening, and metadata. Tests return `Result` and propagate with `?` (no `assert!`/`unwrap`).
+29 behavioral tests via the `motsu` host VM (14 for `urwa20`, 8 for `urwa721`, 7 for `urwa1155`), covering role-gating, allowlist enforcement, freeze semantics, the duplicate-id batch fix, the self-forced-transfer hardening, forced-transfer ownership checks, and metadata. Tests return `Result` and propagate with `?` (no `assert!`/`unwrap`).
 
 ## Build (deployable)
 
@@ -88,9 +90,20 @@ cargo stylus deploy \
   --no-verify
 ```
 
+uRWA-721 (`constructor(address admin)`):
+
+```bash
+cargo stylus deploy \
+  --wasm-file target/wasm32-unknown-unknown/release/urwa721.opt.wasm \
+  --constructor-signature "constructor(address)" \
+  --constructor-args <INITIAL_ADMIN_ADDRESS> \
+  --endpoint https://sepolia-rollup.arbitrum.io/rpc \
+  --private-key <YOUR_TESTNET_KEY> \
+  --no-verify
+```
+
 ## Known follow-ups
 
-- ERC-1155 URI metadata extension (uRWA-20 metadata is implemented).
-- ERC-721 uRWA variant.
+- Name / symbol / token-URI metadata for `urwa721` and `urwa1155` (uRWA-20 metadata is implemented).
 - A differential-test harness (Rust vs the Solidity reference).
 - Migrate off the deprecated `stylus_sdk::evm::log` / `msg::sender` helpers to the `.vm()` host API.

@@ -25,7 +25,7 @@ RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" cargo build \
   -Z build-std=std,panic_abort \
   --release --target wasm32-unknown-unknown --workspace --lib
 
-for c in urwa20 urwa1155; do
+for c in urwa20 urwa1155 urwa721; do
   echo ">> wasm-opt $c"
   wasm-opt -Oz -all --strip-debug "$OUT/$c.wasm" -o "$OUT/$c.opt.wasm"
   echo ">> cargo stylus check $c (compressed size must be <= 24 KB)"
@@ -34,4 +34,4 @@ for c in urwa20 urwa1155; do
 done
 
 echo ">> deployable artifacts:"
-ls -la "$OUT"/urwa20.opt.wasm "$OUT"/urwa1155.opt.wasm
+ls -la "$OUT"/urwa20.opt.wasm "$OUT"/urwa1155.opt.wasm "$OUT"/urwa721.opt.wasm

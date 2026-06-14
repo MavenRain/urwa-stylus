@@ -11,9 +11,12 @@ stylus-sdk.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 keccak-const.workspace = true
+ruint.workspace = true # resolver pin only; see workspace Cargo.toml
 
 [dev-dependencies]
 motsu.workspace = true
+arbitrary.workspace = true # resolver pin only; see workspace Cargo.toml
+derive_arbitrary.workspace = true # resolver pin only; see workspace Cargo.toml
 
 [features]
 export-abi = ["openzeppelin-stylus/export-abi", "stylus-sdk/export-abi"]

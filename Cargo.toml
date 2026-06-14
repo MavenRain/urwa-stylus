@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/urwa20", "crates/urwa1155"]
+members = ["crates/urwa20", "crates/urwa1155", "crates/urwa721"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,15 @@ alloy-primitives = { version = "=0.8.20", default-features = false, features = [
 alloy-sol-types = { version = "=0.8.20", default-features = false }
 keccak-const = "0.2.0"
 motsu = "=0.10.0"
+
+# Pinned transitive dependencies. Not used directly; the exact pins keep the build
+# reproducible WITHOUT committing Cargo.lock:
+#   * ruint > 1.14.0 makes stylus-sdk 0.9.0 fail to compile (a to_be_bytes::<32> const panic).
+#   * arbitrary / derive_arbitrary must be the SAME version (a 1.4.1 vs 1.4.2 skew makes
+#     alloy-primitives' `arbitrary` feature, pulled in by motsu in dev/test builds, fail).
+ruint = { version = "=1.14.0", default-features = false }
+arbitrary = "=1.4.1"
+derive_arbitrary = "=1.4.1"
 
 [profile.release]
 codegen-units = 1
