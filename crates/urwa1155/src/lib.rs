@@ -53,6 +53,9 @@ sol! {
     error ERC7943CannotTransfer(address from, address to, uint256 tokenId, uint256 amount);
     /// The amount exceeds the account's unfrozen balance of `tokenId`.
     error ERC7943InsufficientUnfrozenBalance(address account, uint256 tokenId, uint256 amount, uint256 unfrozen);
+
+    /// `initialize` has already been called.
+    error AlreadyInitialized();
 }
 
 /// Aggregated error type surfaced by the contract's external methods.
@@ -72,6 +75,7 @@ enum Error {
     CannotReceive(ERC7943CannotReceive),
     CannotTransfer(ERC7943CannotTransfer),
     InsufficientUnfrozenBalance(ERC7943InsufficientUnfrozenBalance),
+    AlreadyInitialized(AlreadyInitialized),
 }
 
 impl From<control::Error> for Error {
@@ -121,6 +125,7 @@ struct URWA1155 {
     erc1155: Erc1155,
     access: AccessControl,
     metadata: Erc1155MetadataUri,
+    initialized: StorageBool,
     send_whitelist: StorageMap<Address, StorageBool>,
     receive_whitelist: StorageMap<Address, StorageBool>,
     frozen: StorageMap<Address, StorageMap<U256, StorageU256>>,
@@ -129,8 +134,14 @@ struct URWA1155 {
 #[public]
 #[implements(IErc1155<Error = Error>, IErc1155MetadataUri, IAccessControl<Error = control::Error>, IErc165)]
 impl URWA1155 {
-    #[constructor]
-    fn constructor(&mut self, uri: String, initial_admin: Address) {
+    /// One-time initializer (used instead of a Stylus `#[constructor]`, which does not run
+    /// when deploying the prebuilt wasm via `cargo stylus deploy --wasm-file`). Call once,
+    /// immediately after deployment.
+    fn initialize(&mut self, uri: String, initial_admin: Address) -> Result<(), Error> {
+        (!self.initialized.get())
+            .then_some(())
+            .ok_or(Error::AlreadyInitialized(AlreadyInitialized {}))?;
+        self.initialized.set(true);
         self.metadata.constructor(uri);
         self.access._grant_role(AccessControl::DEFAULT_ADMIN_ROLE.into(), initial_admin);
         self.access._grant_role(MINTER_ROLE.into(), initial_admin);
@@ -138,6 +149,7 @@ impl URWA1155 {
         self.access._grant_role(FREEZING_ROLE.into(), initial_admin);
         self.access._grant_role(WHITELIST_ROLE.into(), initial_admin);
         self.access._grant_role(FORCE_TRANSFER_ROLE.into(), initial_admin);
+        Ok(())
     }
 
     /// Whether `account` may send tokens (send-allowlist membership).
@@ -425,7 +437,8 @@ mod tests {
         admin: Address,
         who: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("ipfs://props/{id}.json".into(), admin);
+        // Idempotent: the first call initializes; later calls hit AlreadyInitialized (ignored).
+        let _ = contract.sender(admin).initialize("ipfs://props/{id}.json".into(), admin);
         contract.sender(admin).change_send_whitelist(who, true).ortest("send wl")?;
         contract.sender(admin).change_receive_whitelist(who, true).ortest("recv wl")?;
         Ok(())
@@ -450,7 +463,7 @@ mod tests {
 
     #[motsu::test]
     fn uri_returns_template_for_all_ids(contract: Contract<URWA1155>, admin: Address) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("ipfs://props/{id}.json".into(), admin);
+        contract.sender(admin).initialize("ipfs://props/{id}.json".into(), admin).ortest("init")?;
         ensure(contract.sender(admin).uri(n(1)) == "ipfs://props/{id}.json", "uri id 1")?;
         ensure(contract.sender(admin).uri(n(999)) == "ipfs://props/{id}.json", "uri same for all ids")?;
         Ok(())
@@ -511,7 +524,7 @@ mod tests {
         holder: Address,
         dest: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("ipfs://props/{id}.json".into(), admin);
+        contract.sender(admin).initialize("ipfs://props/{id}.json".into(), admin).ortest("init")?;
         contract.sender(admin).change_receive_whitelist(holder, true).ortest("holder recv")?;
         contract.sender(admin).mint(holder, n(ID), n(100)).ortest("mint")?;
         // holder not send-allowlisted, dest not receive-allowlisted.
@@ -840,7 +853,7 @@ mod tests {
         b: Address,
         c: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("ipfs://{id}".into(), admin);
+        contract.sender(admin).initialize("ipfs://{id}".into(), admin).ortest("init")?;
         let actors = [admin, a, b, c];
         let mut model = Ref1155::new(admin);
         let mut rng = Lcg::new(0xD1CE_F00D_C0FF_EE01);

@@ -52,6 +52,9 @@ sol! {
     error ERC7943CannotTransfer(address from, address to, uint256 amount);
     /// The amount exceeds the account's unfrozen balance.
     error ERC7943InsufficientUnfrozenBalance(address account, uint256 amount, uint256 unfrozen);
+
+    /// `initialize` has already been called.
+    error AlreadyInitialized();
 }
 
 /// Aggregated error type surfaced by the contract's external methods.
@@ -69,6 +72,7 @@ enum Error {
     CannotReceive(ERC7943CannotReceive),
     CannotTransfer(ERC7943CannotTransfer),
     InsufficientUnfrozenBalance(ERC7943InsufficientUnfrozenBalance),
+    AlreadyInitialized(AlreadyInitialized),
 }
 
 impl From<control::Error> for Error {
@@ -111,6 +115,7 @@ struct URWA20 {
     erc20: Erc20,
     access: AccessControl,
     metadata: Erc20Metadata,
+    initialized: StorageBool,
     send_whitelist: StorageMap<Address, StorageBool>,
     receive_whitelist: StorageMap<Address, StorageBool>,
     frozen: StorageMap<Address, StorageU256>,
@@ -119,8 +124,15 @@ struct URWA20 {
 #[public]
 #[implements(IErc20<Error = Error>, IErc20Metadata, IAccessControl<Error = control::Error>, IErc165)]
 impl URWA20 {
-    #[constructor]
-    fn constructor(&mut self, name: String, symbol: String, initial_admin: Address) {
+    /// One-time initializer: sets metadata and grants every role to `initial_admin`.
+    /// Used instead of a Stylus `#[constructor]` because constructors do not run when
+    /// deploying the prebuilt wasm via `cargo stylus deploy --wasm-file` (the only path that
+    /// fits the 24 KB size limit). Call this once, immediately after deployment.
+    fn initialize(&mut self, name: String, symbol: String, initial_admin: Address) -> Result<(), Error> {
+        (!self.initialized.get())
+            .then_some(())
+            .ok_or(Error::AlreadyInitialized(AlreadyInitialized {}))?;
+        self.initialized.set(true);
         self.metadata.constructor(name, symbol);
         self.access._grant_role(AccessControl::DEFAULT_ADMIN_ROLE.into(), initial_admin);
         self.access._grant_role(MINTER_ROLE.into(), initial_admin);
@@ -128,6 +140,7 @@ impl URWA20 {
         self.access._grant_role(FREEZING_ROLE.into(), initial_admin);
         self.access._grant_role(WHITELIST_ROLE.into(), initial_admin);
         self.access._grant_role(FORCE_TRANSFER_ROLE.into(), initial_admin);
+        Ok(())
     }
 
     /// Whether `account` may send tokens (send-allowlist membership).
@@ -392,7 +405,9 @@ mod tests {
         admin: Address,
         who: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("uRWA Test".into(), "URWA".into(), admin);
+        // Idempotent: the first call initializes (granting admin the roles); later calls
+        // harmlessly hit AlreadyInitialized, which we ignore so the helper works per-address.
+        let _ = contract.sender(admin).initialize("uRWA Test".into(), "URWA".into(), admin);
         contract.sender(admin).change_send_whitelist(who, true).ortest("send wl")?;
         contract.sender(admin).change_receive_whitelist(who, true).ortest("recv wl")?;
         Ok(())
@@ -400,7 +415,7 @@ mod tests {
 
     #[motsu::test]
     fn constructor_grants_all_roles(contract: Contract<URWA20>, admin: Address) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("uRWA Test".into(), "URWA".into(), admin);
+        contract.sender(admin).initialize("uRWA Test".into(), "URWA".into(), admin).ortest("init")?;
         let c = contract.sender(admin);
         ensure(c.has_role(MINTER_ROLE.into(), admin), "MINTER")?;
         ensure(c.has_role(BURNER_ROLE.into(), admin), "BURNER")?;
@@ -413,7 +428,7 @@ mod tests {
 
     #[motsu::test]
     fn metadata_is_set(contract: Contract<URWA20>, admin: Address) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("uRWA Real Estate".into(), "uRWA".into(), admin);
+        contract.sender(admin).initialize("uRWA Real Estate".into(), "uRWA".into(), admin).ortest("init")?;
         ensure(contract.sender(admin).name() == "uRWA Real Estate", "name")?;
         ensure(contract.sender(admin).symbol() == "uRWA", "symbol")?;
         ensure(contract.sender(admin).decimals() == U8::from(18), "decimals 18")?;
@@ -443,7 +458,7 @@ mod tests {
         holder: Address,
         dest: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("uRWA Test".into(), "URWA".into(), admin);
+        contract.sender(admin).initialize("uRWA Test".into(), "URWA".into(), admin).ortest("init")?;
         // holder can receive (so it can be minted to) but is NOT send-allowlisted.
         contract.sender(admin).change_receive_whitelist(holder, true).ortest("recv wl")?;
         setup_allowlisted(&contract, admin, dest)?;
@@ -586,7 +601,7 @@ mod tests {
         admin: Address,
         holder: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("uRWA Test".into(), "URWA".into(), admin);
+        contract.sender(admin).initialize("uRWA Test".into(), "URWA".into(), admin).ortest("init")?;
         // holder not allowlisted yet: mint must fail.
         ensure(contract.sender(admin).mint(holder, n(100)).is_err(), "mint to non-allowlisted reverts")?;
         contract.sender(admin).change_receive_whitelist(holder, true).ortest("recv wl")?;
@@ -870,7 +885,7 @@ mod tests {
         b: Address,
         c: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("Diff".into(), "DIF".into(), admin);
+        contract.sender(admin).initialize("Diff".into(), "DIF".into(), admin).ortest("init")?;
         let actors = [admin, a, b, c];
         let mut model = Ref20::new(admin);
         let mut rng = Lcg::new(0x9E3779B97F4A7C15);

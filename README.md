@@ -9,10 +9,16 @@ RWA compliance checks (allowlists, freeze accounting) run on every transfer, min
 | Crate | Standard | ERC-7943 surface | Compressed size |
 |-------|----------|------------------|-----------------|
 | [`urwa20`](crates/urwa20) | ERC-20 + metadata | fungible (fractional shares) | 17.3 KB |
-| [`urwa721`](crates/urwa721) | ERC-721 + metadata | non-fungible (deed / title) | 23.3 KB |
-| [`urwa1155`](crates/urwa1155) | ERC-1155 + metadata URI | multi-token | 24.0 KB |
+| [`urwa721`](crates/urwa721) | ERC-721 + metadata | non-fungible (deed / title) | 23.4 KB |
+| [`urwa1155`](crates/urwa1155) | ERC-1155 + metadata URI | multi-token | 23.9 KB |
 
-Both are under the 24 KB compressed Stylus limit and were validated against the live Arbitrum Sepolia network (`cargo stylus check`).
+All three are under the 24 KB compressed Stylus limit and are **deployed and initialized on Arbitrum Sepolia** (chain 421614):
+
+| Contract | Address |
+|----------|---------|
+| uRWA20 | [`0x735d109388684a400d83439ade432d8eb449db6a`](https://sepolia.arbiscan.io/address/0x735d109388684a400d83439ade432d8eb449db6a) |
+| uRWA721 | [`0xaa9e84f4cf3d1c4ff0a6c629dc06334ca959f769`](https://sepolia.arbiscan.io/address/0xaa9e84f4cf3d1c4ff0a6c629dc06334ca959f769) |
+| uRWA1155 | [`0x43afd2e684a9236ba04198f6c19236eb915fef16`](https://sepolia.arbiscan.io/address/0x43afd2e684a9236ba04198f6c19236eb915fef16) |
 
 Each implements send/receive allowlists, role-gated mint/burn (`AccessControl`), per-position freezing, `forcedTransfer` for compliance/recovery, and the `canSend` / `canReceive` / `getFrozenTokens` / `canTransfer` views.
 
@@ -66,43 +72,22 @@ This produces `target/wasm32-unknown-unknown/release/urwa20.opt.wasm` and `urwa1
 
 ## Deploy (Arbitrum Sepolia testnet)
 
-Requires a funded Arbitrum Sepolia account. The constructor grants the initial admin every role (admin, minter, burner, freezing, whitelist, force-transfer).
+Requires a funded Arbitrum Sepolia account, with its `0x`-prefixed private key in a file (e.g. `~/.urwa-deploy.key`, `chmod 600`).
 
-uRWA-20 (`constructor(string name, string symbol, address admin)`):
-
-```bash
-cargo stylus deploy \
-  --wasm-file target/wasm32-unknown-unknown/release/urwa20.opt.wasm \
-  --constructor-signature "constructor(string,string,address)" \
-  --constructor-args "uRWA Property" "uRWA" <INITIAL_ADMIN_ADDRESS> \
-  --endpoint https://sepolia-rollup.arbitrum.io/rpc \
-  --private-key <YOUR_TESTNET_KEY> \
-  --no-verify
-```
-
-uRWA-1155 (`constructor(string uri, address admin)`):
+Stylus `#[constructor]`s do **not** run when deploying a prebuilt wasm with `cargo stylus deploy --wasm-file` (the only path that fits the 24 KB limit), so each contract uses a guarded one-time `initialize()` instead. `scripts/deploy-sepolia.sh` does both steps: it deploys the wasm, then sends one `initialize` transaction granting every role (admin, minter, burner, freezing, whitelist, force-transfer) to `<admin>`:
 
 ```bash
-cargo stylus deploy \
-  --wasm-file target/wasm32-unknown-unknown/release/urwa1155.opt.wasm \
-  --constructor-signature "constructor(string,address)" \
-  --constructor-args "ipfs://your-cdn/{id}.json" <INITIAL_ADMIN_ADDRESS> \
-  --endpoint https://sepolia-rollup.arbitrum.io/rpc \
-  --private-key <YOUR_TESTNET_KEY> \
-  --no-verify
+./scripts/build-release.sh                          # produce the .opt.wasm artifacts
+./scripts/deploy-sepolia.sh urwa20   <admin-address>
+./scripts/deploy-sepolia.sh urwa721  <admin-address>
+./scripts/deploy-sepolia.sh urwa1155 <admin-address>
 ```
 
-uRWA-721 (`constructor(string name, string symbol, string baseURI, address admin)`):
+Gotchas the script already handles, worth knowing if you deploy by hand:
 
-```bash
-cargo stylus deploy \
-  --wasm-file target/wasm32-unknown-unknown/release/urwa721.opt.wasm \
-  --constructor-signature "constructor(string,string,string,address)" \
-  --constructor-args "uRWA Deed" "DEED" "ipfs://your-cdn/deeds/" <INITIAL_ADMIN_ADDRESS> \
-  --endpoint https://sepolia-rollup.arbitrum.io/rpc \
-  --private-key <YOUR_TESTNET_KEY> \
-  --no-verify
-```
+- Pass `--max-fee-per-gas-gwei` with headroom; cargo-stylus's one-shot gas estimate otherwise races the block base fee and the node rejects the tx.
+- Put `--constructor-args` (here, none) last; it greedily swallows any flags that follow it.
+- The optimized wasm uses only the Stylus-supported wasm features, never `wasm-opt -all`, which injects reference types that fail activation.
 
 ## Known follow-ups
 

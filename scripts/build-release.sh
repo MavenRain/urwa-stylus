@@ -27,7 +27,12 @@ RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" cargo build \
 
 for c in urwa20 urwa1155 urwa721; do
   echo ">> wasm-opt $c"
-  wasm-opt -Oz -all --strip-debug "$OUT/$c.wasm" -o "$OUT/$c.opt.wasm"
+  # Enable ONLY the WASM features Stylus supports. Do NOT use `-all`: it enables
+  # reference-types, which wasm-opt then emits and Stylus rejects at activation
+  # ("reference types support is not enabled").
+  wasm-opt -Oz \
+    --enable-bulk-memory --enable-sign-ext --enable-mutable-globals --enable-nontrapping-float-to-int \
+    --strip-debug "$OUT/$c.wasm" -o "$OUT/$c.opt.wasm"
   echo ">> cargo stylus check $c (compressed size must be <= 24 KB)"
   cargo stylus check --wasm-file "$OUT/$c.opt.wasm" --endpoint "$ENDPOINT" 2>&1 \
     | grep -iE 'contract size|data fee' || true
