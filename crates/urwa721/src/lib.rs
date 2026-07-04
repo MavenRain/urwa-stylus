@@ -52,6 +52,9 @@ sol! {
     error ERC7943CannotTransfer(address from, address to, uint256 tokenId);
     /// `tokenId` is frozen for `account` and cannot be transferred by the account.
     error ERC7943InsufficientUnfrozenBalance(address account, uint256 tokenId);
+
+    /// `initialize` has already been called.
+    error AlreadyInitialized();
 }
 
 /// Aggregated error type surfaced by the contract's external methods.
@@ -72,6 +75,7 @@ enum Error {
     CannotReceive(ERC7943CannotReceive),
     CannotTransfer(ERC7943CannotTransfer),
     InsufficientUnfrozenBalance(ERC7943InsufficientUnfrozenBalance),
+    AlreadyInitialized(AlreadyInitialized),
 }
 
 impl From<control::Error> for Error {
@@ -122,6 +126,7 @@ struct URWA721 {
     erc721: Erc721,
     access: AccessControl,
     metadata: Erc721Metadata,
+    initialized: StorageBool,
     send_whitelist: StorageMap<Address, StorageBool>,
     receive_whitelist: StorageMap<Address, StorageBool>,
     frozen: StorageMap<Address, StorageMap<U256, StorageBool>>,
@@ -130,8 +135,14 @@ struct URWA721 {
 #[public]
 #[implements(IErc721<Error = Error>, IErc721Metadata<Error = Error>, IAccessControl<Error = control::Error>, IErc165)]
 impl URWA721 {
-    #[constructor]
-    fn constructor(&mut self, name: String, symbol: String, base_uri: String, initial_admin: Address) {
+    /// One-time initializer (used instead of a Stylus `#[constructor]`, which does not run
+    /// when deploying the prebuilt wasm via `cargo stylus deploy --wasm-file`). Call once,
+    /// immediately after deployment.
+    fn initialize(&mut self, name: String, symbol: String, base_uri: String, initial_admin: Address) -> Result<(), Error> {
+        (!self.initialized.get())
+            .then_some(())
+            .ok_or(Error::AlreadyInitialized(AlreadyInitialized {}))?;
+        self.initialized.set(true);
         self.metadata.constructor(name, symbol);
         self.metadata.base_uri.set_str(base_uri);
         self.access._grant_role(AccessControl::DEFAULT_ADMIN_ROLE.into(), initial_admin);
@@ -140,6 +151,7 @@ impl URWA721 {
         self.access._grant_role(FREEZING_ROLE.into(), initial_admin);
         self.access._grant_role(WHITELIST_ROLE.into(), initial_admin);
         self.access._grant_role(FORCE_TRANSFER_ROLE.into(), initial_admin);
+        Ok(())
     }
 
     /// Whether `account` may send tokens (send-allowlist membership).
@@ -411,7 +423,8 @@ mod tests {
         admin: Address,
         who: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin);
+        // Idempotent: the first call initializes; later calls hit AlreadyInitialized (ignored).
+        let _ = contract.sender(admin).initialize("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin);
         contract.sender(admin).change_send_whitelist(who, true).ortest("send wl")?;
         contract.sender(admin).change_receive_whitelist(who, true).ortest("recv wl")?;
         Ok(())
@@ -419,7 +432,7 @@ mod tests {
 
     #[motsu::test]
     fn constructor_grants_roles(contract: Contract<URWA721>, admin: Address) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin);
+        contract.sender(admin).initialize("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin).ortest("init")?;
         let c = contract.sender(admin);
         ensure(c.has_role(MINTER_ROLE.into(), admin), "MINTER")?;
         ensure(c.has_role(FORCE_TRANSFER_ROLE.into(), admin), "FORCE")?;
@@ -448,7 +461,7 @@ mod tests {
         holder: Address,
         mallory: Address,
     ) -> Result<(), TestErr> {
-        contract.sender(admin).constructor("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin);
+        contract.sender(admin).initialize("uRWA Deed".into(), "DEED".into(), "ipfs://deeds/".into(), admin).ortest("init")?;
         // not receive-allowlisted yet
         ensure(contract.sender(admin).safe_mint(holder, n(TOKEN)).is_err(), "mint to non-allowlisted reverts")?;
         contract.sender(admin).change_receive_whitelist(holder, true).ortest("recv wl")?;
